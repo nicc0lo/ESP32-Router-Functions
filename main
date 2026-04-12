@@ -1,147 +1,450 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <vector>
 #include "esp_wifi.h"
+#include "esp_netif.h"
+#include "lwip/ip4_addr.h"
+#include "lwip/etharp.h"
+#include "lwip/netif.h"
+#include "dhcpserver/dhcpserver.h"
 
-// --- Configuration ---
-#define AP_SSID         "ESP32_Secure_Net"
-#define AP_PASSWORD     "gatekeeper"
-#define MAX_STA_CONN    10
+// ── Configuration ─────────────────────────────────────────────
+#define AP_SSID      "ESP32_Secure_Net"
+#define AP_PASSWORD  "gatekeeper"
+#define AP_CHANNEL   1
+#define MAX_CLIENTS  8
+#define MAX_LOGS     30
+#define ACCESS_LOG_COOLDOWN_MS 120000  // 2 minutes
 
-std::vector<String> trusted_macs = {
-    "52:A3:59:D2:B4:72", // Your Trusted Laptop
-    "11:22:33:44:55:66"
+struct AdminDevice {
+    const char* mac;
 };
 
+AdminDevice adminList[] = {
+    {"2C:A7:EF:3F:1C:0B"},
+    {"11:22:33:44:55:66"}
+};
+const int adminCount = sizeof(adminList) / sizeof(adminList[0]);
+
+// ── Globals ───────────────────────────────────────────────────
 WebServer server(80);
 
-// --- Helpers ---
+struct ClientRecord {
+    uint8_t  mac[6];
+    uint8_t  aid;
+    bool     isAdmin;
+    bool     tethering;
+    String   ip;
+};
 
-bool is_mac_trusted(uint8_t* mac) {
+ClientRecord knownClients[MAX_CLIENTS];
+int clientCount = 0;
+
+String securityLogs[MAX_LOGS];
+int logCount = 0;
+
+struct AccessLog {
+    String        ip;
+    unsigned long lastLogged;
+};
+AccessLog recentAccess[MAX_CLIENTS];
+int accessLogCount = 0;
+
+// ── Logging ───────────────────────────────────────────────────
+void addLog(String msg) {
+    String ts = "[" + String(millis() / 1000) + "s] ";
+    for (int i = min(logCount, MAX_LOGS - 1); i > 0; i--)
+        securityLogs[i] = securityLogs[i - 1];
+    securityLogs[0] = ts + msg;
+    if (logCount < MAX_LOGS) logCount++;
+    Serial.println(ts + msg);
+}
+
+bool shouldLogAccess(String ip) {
+    unsigned long now = millis();
+    for (int i = 0; i < accessLogCount; i++) {
+        if (recentAccess[i].ip == ip) {
+            if (now - recentAccess[i].lastLogged < ACCESS_LOG_COOLDOWN_MS)
+                return false;
+            recentAccess[i].lastLogged = now;
+            return true;
+        }
+    }
+    if (accessLogCount < MAX_CLIENTS)
+        recentAccess[accessLogCount++] = {ip, now};
+    return true;
+}
+
+// ── MAC Helpers ───────────────────────────────────────────────
+String macToStr(const uint8_t* mac) {
     char buf[18];
-    sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    for (const String& s : trusted_macs) {
-        if (s.equalsIgnoreCase(buf)) return true;
-    }
+    sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return String(buf);
+}
+
+bool macIsAdmin(const uint8_t* mac) {
+    char buf[18];
+    sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    for (int i = 0; i < adminCount; i++)
+        if (strcasecmp(buf, adminList[i].mac) == 0) return true;
     return false;
 }
 
-// Security: Only allow Trusted MACs to access the Web Server
-bool checkAuth() {
-    uint8_t remote_mac[6];
-    wifi_sta_list_t sta_list;
-    esp_wifi_ap_get_sta_list(&sta_list);
-    
-    // Check if the requester's IP matches a trusted MAC in the current station list
-    for (int i = 0; i < sta_list.num; i++) {
-        if (is_mac_trusted(sta_list.sta[i].mac)) return true;
-    }
+bool strMacIsAdmin(String mac) {
+    for (int i = 0; i < adminCount; i++)
+        if (mac.equalsIgnoreCase(adminList[i].mac)) return true;
     return false;
 }
 
-// --- Web Handlers ---
+// ── ARP Helpers ───────────────────────────────────────────────
+String getIPFromARP(const uint8_t* mac) {
+    struct netif* netif = netif_list;
+    while (netif) {
+        for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+            struct eth_addr* eth;
+            ip4_addr_t* found;
+            if (etharp_get_entry(i, &found, &netif, &eth)) {
+                if (memcmp(eth->addr, mac, 6) == 0)
+                    return IPAddress(found->addr).toString();
+            }
+        }
+        netif = netif->next;
+    }
+    return "Pending...";
+}
 
-void handleRoot() {
-    if (!checkAuth()) {
-        server.send(403, "text/plain", "ACCESS DENIED: Untrusted Hardware.");
+String getMacFromARP(IPAddress ip) {
+    struct netif* netif = netif_list;
+    while (netif) {
+        for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+            struct eth_addr* eth;
+            ip4_addr_t* found;
+            if (etharp_get_entry(i, &found, &netif, &eth)) {
+                if (found->addr == (uint32_t)ip)
+                    return macToStr(eth->addr);
+            }
+        }
+        netif = netif->next;
+    }
+    return "UNKNOWN";
+}
+
+// ── Client Registry ───────────────────────────────────────────
+ClientRecord* findClient(const uint8_t* mac) {
+    for (int i = 0; i < clientCount; i++)
+        if (memcmp(knownClients[i].mac, mac, 6) == 0)
+            return &knownClients[i];
+    return nullptr;
+}
+
+ClientRecord* findClientByIP(String ip) {
+    for (int i = 0; i < clientCount; i++)
+        if (knownClients[i].ip == ip)
+            return &knownClients[i];
+    return nullptr;
+}
+
+void registerClient(const uint8_t* mac, uint8_t aid) {
+    if (findClient(mac)) return;
+    if (clientCount >= MAX_CLIENTS) return;
+    memcpy(knownClients[clientCount].mac, mac, 6);
+    knownClients[clientCount].aid       = aid;
+    knownClients[clientCount].isAdmin   = macIsAdmin(mac);
+    knownClients[clientCount].tethering = false;
+    knownClients[clientCount].ip        = "Pending...";
+    clientCount++;
+}
+
+void removeClient(const uint8_t* mac) {
+    for (int i = 0; i < clientCount; i++) {
+        if (memcmp(knownClients[i].mac, mac, 6) == 0) {
+            knownClients[i] = knownClients[--clientCount];
+            return;
+        }
+    }
+}
+
+// ── Deauth by MAC ─────────────────────────────────────────────
+void deauthByMac(const uint8_t* mac) {
+    ClientRecord* rec = findClient(mac);
+    if (rec) esp_wifi_deauth_sta(rec->aid);
+}
+
+// ── DHCP Pool Config ──────────────────────────────────────────
+void configureIPRanges() {
+    esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap_netif) {
+        addLog("ERROR: Could not get AP netif handle");
         return;
     }
 
-    String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
-    html += "body { font-family: sans-serif; background: #121212; color: #e0e0e0; text-align: center; }";
-    html += ".container { max-width: 500px; margin: auto; padding: 20px; }";
-    html += ".client-card { background: #1e1e1e; border: 1px solid #333; padding: 15px; margin: 10px 0; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; }";
-    html += ".btn { background: #ff5252; color: white; border: none; padding: 8px 15px; border-radius: 5px; cursor: pointer; text-decoration: none; }";
-    html += ".trusted { border-left: 5px solid #4caf50; }";
-    html += ".untrusted { border-left: 5px solid #ff9800; }";
-    html += "</style></head><body><div class='container'>";
-    html += "<h1>🛡️ Gatekeeper Admin</h1><hr>";
-    
+    esp_netif_dhcps_stop(ap_netif);
+
+    dhcps_lease_t lease;
+    lease.enable        = true;
+    lease.start_ip.addr = esp_ip4addr_aton("192.168.4.4");
+    lease.end_ip.addr   = esp_ip4addr_aton("192.168.4.20");
+
+    esp_netif_dhcps_option(
+        ap_netif,
+        ESP_NETIF_OP_SET,
+        ESP_NETIF_REQUESTED_IP_ADDRESS,
+        &lease,
+        sizeof(lease)
+    );
+
+    esp_netif_dhcps_start(ap_netif);
+    addLog("DHCP pool: 192.168.4.4 - 192.168.4.20 (guests only)");
+}
+
+// ── IP Updater Task (runs after DHCP settles) ─────────────────
+void updateAdminIPs(void* param) {
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    for (int i = 0; i < clientCount; i++) {
+        String ip = getIPFromARP(knownClients[i].mac);
+        knownClients[i].ip = ip;
+        if (knownClients[i].isAdmin)
+            addLog("ADMIN IP resolved: " + macToStr(knownClients[i].mac) +
+                   " → " + ip);
+    }
+    vTaskDelete(NULL);
+}
+
+// ── Wi-Fi Events ──────────────────────────────────────────────
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+    switch (event) {
+
+        case ARDUINO_EVENT_WIFI_AP_STACONNECTED: {
+            uint8_t* mac = info.wifi_ap_staconnected.mac;
+            uint8_t  aid = info.wifi_ap_staconnected.aid;
+            bool admin   = macIsAdmin(mac);
+            registerClient(mac, aid);
+            addLog("CONNECTED [" + String(admin ? "ADMIN" : "GUEST") +
+                   "] MAC: " + macToStr(mac) + " | AID: " + String(aid));
+            // Resolve IP after DHCP settles
+            xTaskCreate(updateAdminIPs, "ipUpdate", 2048, NULL, 1, NULL);
+            break;
+        }
+
+        case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED: {
+            uint8_t* mac = info.wifi_ap_stadisconnected.mac;
+            ClientRecord* rec = findClient(mac);
+            String role = (rec && rec->isAdmin) ? "ADMIN" : "GUEST";
+            addLog("DISCONNECTED [" + role + "] MAC: " + macToStr(mac));
+            removeClient(mac);
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+// ── Tethering Detection ───────────────────────────────────────
+void packet_handler(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (type != WIFI_PKT_DATA) return;
+
+    wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+    uint8_t* payload = pkt->payload;
+    uint16_t len     = pkt->rx_ctrl.sig_len;
+
+    if (len < 52) return;
+
+    uint8_t fc0          = payload[0];
+    uint8_t type_bits    = (fc0 >> 2) & 0x03;
+    uint8_t subtype_bits = (fc0 >> 4) & 0x0F;
+
+    // Only data frames
+    if (type_bits != 2) return;
+
+    // To-DS=1, From-DS=0 → client sending to AP
+    uint8_t fc1    = payload[1];
+    uint8_t tods   = fc1 & 0x01;
+    uint8_t fromds = (fc1 >> 1) & 0x01;
+    if (tods != 1 || fromds != 0) return;
+
+    // Addr2 = transmitting STA (bytes 10–15)
+    uint8_t* src_mac = payload + 10;
+    if (!macIsAdmin(src_mac)) return;
+
+    // QoS data adds 2-byte QoS field
+    bool qos          = (subtype_bits == 8);
+    int  dot11_hdr    = qos ? 26 : 24;
+
+    if (len < (uint16_t)(dot11_hdr + 8 + 20)) return;
+
+    // LLC/SNAP check
+    uint8_t* llc = payload + dot11_hdr;
+    if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03) return;
+
+    uint16_t ethertype = (llc[6] << 8) | llc[7];
+    if (ethertype != 0x0800) return; // IPv4 only
+
+    uint8_t* ip = llc + 8;
+    if ((ip[0] & 0xF0) != 0x40) return;
+
+    uint8_t ttl     = ip[8];
+    bool tethered   = (ttl == 63 || ttl == 127 || ttl == 254);
+    if (!tethered) return;
+
+    ClientRecord* rec = findClient(src_mac);
+    if (rec && !rec->tethering) {
+        rec->tethering = true;
+        addLog("TETHER DETECTED [ADMIN] MAC: " + macToStr(src_mac) +
+               " | IP: " + rec->ip + " | TTL: " + String(ttl) + " — KICKING!");
+        deauthByMac(src_mac);
+    }
+}
+
+// ── Auth Check ────────────────────────────────────────────────
+bool isAuthorizedRequest(String& outMac) {
+    IPAddress clientIP = server.client().remoteIP();
+    outMac = getMacFromARP(clientIP);
+
+    if (outMac == "UNKNOWN") {
+        addLog("WEB BLOCKED — MAC unresolved for IP: " + clientIP.toString());
+        return false;
+    }
+
+    if (!strMacIsAdmin(outMac)) return false;
+
+    // Block if currently tethering
+    for (int i = 0; i < clientCount; i++) {
+        if (macToStr(knownClients[i].mac).equalsIgnoreCase(outMac) &&
+            knownClients[i].tethering) {
+            addLog("WEB BLOCKED (TETHERING) — MAC: " + outMac);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// ── Web Dashboard ─────────────────────────────────────────────
+void handleRoot() {
+    String    clientMAC;
+    IPAddress clientIP = server.client().remoteIP();
+
+    if (!isAuthorizedRequest(clientMAC)) {
+        // Only log blocked attempts once per cooldown too
+        if (shouldLogAccess("BLOCK_" + clientIP.toString()))
+            addLog("BLOCKED WEB ACCESS — IP: " + clientIP.toString() +
+                   " | MAC: " + clientMAC);
+        server.send(403, "text/html",
+            "<html><body style='font-family:monospace;background:#111;"
+            "color:#f55;padding:40px'>"
+            "<h1>403 Forbidden</h1><p>Admin hardware only.</p>"
+            "</body></html>");
+        return;
+    }
+
+    // Log access at most once every 2 minutes per IP
+    if (shouldLogAccess(clientIP.toString()))
+        addLog("ADMIN WEB ACCESS — IP: " + clientIP.toString() +
+               " | MAC: " + clientMAC);
+
+    String html = R"(
+    <html><head>
+    <meta http-equiv='refresh' content='5'>
+    <style>
+      body  { font-family:monospace; background:#0d0d0d; color:#ccc;
+              padding:24px; margin:0; }
+      h1    { color:#4fc3f7; margin-bottom:4px; }
+      h3    { color:#90caf9; border-bottom:1px solid #333; padding-bottom:6px; }
+      .logs { background:#000; color:#00e676; padding:14px; height:240px;
+              overflow-y:scroll; border:1px solid #222; font-size:12px;
+              line-height:1.6; }
+      table { width:100%; border-collapse:collapse; margin-top:8px;
+              font-size:13px; }
+      th    { background:#1a1a2e; color:#90caf9; padding:10px; text-align:left; }
+      td    { padding:9px 10px; border-bottom:1px solid #1a1a1a; }
+      tr:hover td { background:#111; }
+      .pill       { display:inline-block; padding:2px 10px; border-radius:99px;
+                    font-size:11px; font-weight:bold; }
+      .p-admin    { background:#1b4332; color:#69f0ae; }
+      .p-guest    { background:#3e2000; color:#ffb74d; }
+      .p-tether   { background:#3e0000; color:#ff5252; }
+      .p-ok       { color:#444; }
+    </style>
+    </head><body>
+    <h1>Gatekeeper Dashboard</h1>
+    <p style='color:#555;font-size:12px;margin-top:0'>Auto-refreshes every 5s</p>
+    )";
+
+    // ── Logs ──────────────────────────────────────────────────
+    html += "<h3>Security Logs</h3><div class='logs'>";
+    for (int i = 0; i < logCount; i++)
+        html += securityLogs[i] + "<br>";
+    html += "</div>";
+
+    // ── Client Table ──────────────────────────────────────────
     wifi_sta_list_t sta_list;
     esp_wifi_ap_get_sta_list(&sta_list);
-    
-    html += "<h3>Active Stations: " + String(sta_list.num) + "</h3>";
-    
+
+    html += "<h3>Connected Clients (" + String(sta_list.num) + ")</h3>";
+    html += "<table><tr><th>MAC</th><th>IP</th><th>AID</th>"
+            "<th>Role</th><th>Tethering</th></tr>";
+
     for (int i = 0; i < sta_list.num; i++) {
-        char buf[20];
-        uint8_t* m = sta_list.sta[i].mac;
-        sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
-        bool trusted = is_mac_trusted(m);
-        
-        html += "<div class='client-card " + String(trusted ? "trusted" : "untrusted") + "'>";
-        html += "<div><strong>" + String(buf) + "</strong><br><small>" + String(trusted ? "ADMIN" : "GUEST") + "</small></div>";
-        
-        if (!trusted) {
-            // Button links to /kick with the AID as a parameter
-            html += "<a href='/kick?aid=" + String(i + 1) + "' class='btn'>KICK</a>";
-        }
-        html += "</div>";
+        uint8_t* mac    = sta_list.sta[i].mac;
+        String   macStr = macToStr(mac);
+        bool     admin  = macIsAdmin(mac);
+        String   ip     = getIPFromARP(mac);
+
+        ClientRecord* rec  = findClient(mac);
+        bool tethering     = rec ? rec->tethering : false;
+        uint8_t aid        = rec ? rec->aid : 0;
+
+        String roleTag   = admin
+            ? "<span class='pill p-admin'>ADMIN</span>"
+            : "<span class='pill p-guest'>GUEST</span>";
+        String tetherTag = tethering
+            ? "<span class='pill p-tether'>YES</span>"
+            : "<span class='p-ok'>—</span>";
+
+        html += "<tr><td>" + macStr + "</td><td>" + ip + "</td><td>" +
+                String(aid) + "</td><td>" + roleTag + "</td><td>" +
+                tetherTag + "</td></tr>";
     }
-    
-    html += "</div></body></html>";
+
+    if (sta_list.num == 0)
+        html += "<tr><td colspan='5' style='color:#333;text-align:center;"
+                "padding:20px'>No clients connected</td></tr>";
+
+    html += "</table></body></html>";
     server.send(200, "text/html", html);
 }
 
-void handleKick() {
-    if (!checkAuth()) return;
-    if (server.hasArg("aid")) {
-        int aid = server.arg("aid").toInt();
-        esp_wifi_deauth_sta(aid);
-        Serial.printf("[ADMIN] Manually kicked AID: %d\n", aid);
-    }
-    server.sendHeader("Location", "/");
-    server.send(303); // Redirect back to home
-}
-
-// --- Sniffer ---
-
-void packet_handler(void *buf, wifi_promiscuous_pkt_type_t type) {
-    if (type != WIFI_PKT_DATA) return;
-    wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
-    uint8_t *payload = pkt->payload;
-    uint8_t *transmitter_mac = payload + 10; 
-
-    uint8_t subtype = (payload[0] >> 4) & 0x0F;
-    int offset = (subtype == 0x08) ? 34 : 32; 
-    uint8_t *ip = payload + offset;
-
-    if (ip[0] == 0x45) { // IPv4
-        uint8_t ttl = ip[8];
-        if (ttl == 63 || ttl == 127 || ttl == 254) {
-            if (!is_mac_trusted(transmitter_mac)) {
-                wifi_sta_list_t sta_list;
-                esp_wifi_ap_get_sta_list(&sta_list);
-                for (int i = 0; i < sta_list.num; i++) {
-                    if (memcmp(sta_list.sta[i].mac, transmitter_mac, 6) == 0) {
-                        Serial.printf("[AUTO-BLOCK] Tethering caught from " MACSTR "\n", MAC2STR(transmitter_mac));
-                        esp_wifi_deauth_sta(i + 1); 
-                    }
-                }
-            }
-        }
-    }
-}
-
-// --- Setup & Loop ---
-
+// ── Setup ─────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    esp_wifi_set_ps(WIFI_PS_NONE); 
-    
+    delay(500);
+
+    WiFi.onEvent(onWiFiEvent);
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASSWORD, 1); // Locked to Channel 1
+    WiFi.softAPConfig(
+        IPAddress(192, 168, 4, 1),
+        IPAddress(192, 168, 4, 1),
+        IPAddress(255, 255, 255, 0)
+    );
+    WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, 0, MAX_CLIENTS);
+
+    configureIPRanges();
 
     server.on("/", handleRoot);
-    server.on("/kick", handleKick);
     server.begin();
 
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(&packet_handler);
 
-    Serial.println("🛡️ Admin Portal & Sniffer Active");
+    addLog("System online | SSID: " + String(AP_SSID));
+    addLog("Guest DHCP pool: 192.168.4.4 - 192.168.4.20");
+    addLog("Admins registered: " + String(adminCount));
 }
 
+// ── Loop ──────────────────────────────────────────────────────
 void loop() {
-    server.handleClient(); // Critical for web server to work
+    server.handleClient();
 }
