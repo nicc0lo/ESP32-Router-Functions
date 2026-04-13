@@ -1,0 +1,899 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include "esp_wifi.h"
+#include "esp_netif.h"
+#include "lwip/ip4_addr.h"
+#include "lwip/etharp.h"
+#include "lwip/netif.h"
+#include "dhcpserver/dhcpserver.h"
+
+#define AP_SSID "ESP32_Secure_Net"
+#define AP_PASSWORD "gatekeeper"
+#define AP_CHANNEL 1
+#define MAX_CLIENTS 8
+#define MAX_LOGS 30
+#define ACCESS_LOG_COOLDOWN_MS 120000
+
+#define TOTAL_BW_MBPS     300
+#define TOTAL_BW_KBPS     (TOTAL_BW_MBPS * 1000)
+
+// WFQ
+#define WINDOW_MS          200
+#define WEIGHT_ADMIN         8
+#define WEIGHT_GUEST         3
+#define BUCKET_MAX_BYTES 16384
+
+#define DNS_PORT 53
+
+struct AdminDevice { const char* mac; };
+AdminDevice adminList[] = {
+    {"2C:A7:EF:3F:1C:0B"},
+    {"11:22:33:44:55:66"},
+    {"98:59:7A:FD:E7:BF"}
+};
+const int adminCount = sizeof(adminList) / sizeof(adminList[0]);
+
+struct ClientRecord {
+    uint8_t  mac[6];
+    uint8_t  aid;
+    bool     active;
+    bool     isAdmin;
+    bool     tethering;
+    bool     blocked;         // kicked by admin
+    String   ip;
+    uint8_t  weight;
+    uint32_t allocKbps;
+    uint32_t tokenBucket;
+    uint32_t bytesTx;
+    uint32_t totalBytesTx;
+    uint32_t droppedPkts;
+};
+
+struct AccessLog {
+    String        ip;
+    unsigned long lastLogged;
+};
+
+ClientRecord clients[MAX_CLIENTS];
+int          clientCount    = 0;
+String       securityLogs[MAX_LOGS];
+int          logCount       = 0;
+AccessLog    recentAccess[MAX_CLIENTS];
+int          accessLogCount = 0;
+uint32_t     lastWindowMs   = 0;
+uint32_t     windowIndex    = 0;
+
+// Blocked MAC list — persists across reconnects until ESP32 reboots
+String blockedMacs[MAX_CLIENTS];
+int    blockedCount = 0;
+
+WebServer server(80);
+DNSServer dnsServer;
+
+// Logging
+void addLog(String msg) {
+    String ts = "[" + String(millis() / 1000) + "s] ";
+    for (int i = min(logCount, MAX_LOGS - 1); i > 0; i--)
+        securityLogs[i] = securityLogs[i - 1];
+    securityLogs[0] = ts + msg;
+    if (logCount < MAX_LOGS) logCount++;
+    Serial.println(ts + msg);
+}
+
+bool shouldLogAccess(String ip) {
+    unsigned long now = millis();
+    for (int i = 0; i < accessLogCount; i++) {
+        if (recentAccess[i].ip == ip) {
+            if (now - recentAccess[i].lastLogged < ACCESS_LOG_COOLDOWN_MS)
+                return false;
+            recentAccess[i].lastLogged = now;
+            return true;
+        }
+    }
+    if (accessLogCount < MAX_CLIENTS)
+        recentAccess[accessLogCount++] = {ip, now};
+    return true;
+}
+
+
+// MAC 
+String macToStr(const uint8_t* mac) {
+    char buf[18];
+    sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return String(buf);
+}
+
+bool macIsAdmin(const uint8_t* mac) {
+    char buf[18];
+    sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    for (int i = 0; i < adminCount; i++)
+        if (strcasecmp(buf, adminList[i].mac) == 0) return true;
+    return false;
+}
+
+bool strMacIsAdmin(String mac) {
+    for (int i = 0; i < adminCount; i++)
+        if (mac.equalsIgnoreCase(adminList[i].mac)) return true;
+    return false;
+}
+
+bool isMacBlocked(const String& mac) {
+    for (int i = 0; i < blockedCount; i++)
+        if (blockedMacs[i].equalsIgnoreCase(mac)) return true;
+    return false;
+}
+
+bool isMacBlocked(const uint8_t* mac) {
+    return isMacBlocked(macToStr(mac));
+}
+
+void blockMac(const String& mac) {
+    if (isMacBlocked(mac)) return;
+    if (blockedCount < MAX_CLIENTS)
+        blockedMacs[blockedCount++] = mac;
+}
+
+void unblockMac(const String& mac) {
+    for (int i = 0; i < blockedCount; i++) {
+        if (blockedMacs[i].equalsIgnoreCase(mac)) {
+            blockedMacs[i] = blockedMacs[--blockedCount];
+            return;
+        }
+    }
+}
+
+
+// ARP 
+String getIPFromARP(const uint8_t* mac) {
+    struct netif* netif = netif_list;
+    while (netif) {
+        for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+            struct eth_addr* eth;
+            ip4_addr_t* found;
+            if (etharp_get_entry(i, &found, &netif, &eth))
+                if (memcmp(eth->addr, mac, 6) == 0)
+                    return IPAddress(found->addr).toString();
+        }
+        netif = netif->next;
+    }
+    return "Pending...";
+}
+
+String getMacFromARP(IPAddress ip) {
+    struct netif* netif = netif_list;
+    while (netif) {
+        for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+            struct eth_addr* eth;
+            ip4_addr_t* found;
+            if (etharp_get_entry(i, &found, &netif, &eth))
+                if (found->addr == (uint32_t)ip)
+                    return macToStr(eth->addr);
+        }
+        netif = netif->next;
+    }
+    return "UNKNOWN";
+}
+
+// Client registry
+ClientRecord* findClient(const uint8_t* mac) {
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i].active && memcmp(clients[i].mac, mac, 6) == 0)
+            return &clients[i];
+    return nullptr;
+}
+
+ClientRecord* findClientByIP(String ip) {
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i].active && clients[i].ip == ip)
+            return &clients[i];
+    return nullptr;
+}
+
+ClientRecord* addClient(const uint8_t* mac, uint8_t aid) {
+    ClientRecord* existing = findClient(mac);
+    if (existing) return existing;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!clients[i].active) {
+            memcpy(clients[i].mac, mac, 6);
+            clients[i].aid          = aid;
+            clients[i].active       = true;
+            clients[i].isAdmin      = macIsAdmin(mac);
+            clients[i].tethering    = false;
+            clients[i].blocked      = isMacBlocked(mac);
+            clients[i].ip           = "Pending...";
+            clients[i].weight       = clients[i].isAdmin ? WEIGHT_ADMIN : WEIGHT_GUEST;
+            clients[i].allocKbps    = 0;
+            clients[i].tokenBucket  = 0;
+            clients[i].bytesTx      = 0;
+            clients[i].totalBytesTx = 0;
+            clients[i].droppedPkts  = 0;
+            clientCount++;
+            return &clients[i];
+        }
+    }
+    return nullptr;
+}
+
+void removeClient(const uint8_t* mac) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].active && memcmp(clients[i].mac, mac, 6) == 0) {
+            memset(&clients[i], 0, sizeof(ClientRecord));
+            clientCount--;
+            return;
+        }
+    }
+}
+
+void deauthByMac(const uint8_t* mac) {
+    ClientRecord* rec = findClient(mac);
+    if (rec) esp_wifi_deauth_sta(rec->aid);
+}
+
+void deauthByMacStr(const String& macStr) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].active &&
+            macToStr(clients[i].mac).equalsIgnoreCase(macStr)) {
+            esp_wifi_deauth_sta(clients[i].aid);
+            return;
+        }
+    }
+}
+
+// DHCP pool
+void configureIPRanges() {
+    esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap_netif) { addLog("ERROR: no AP netif"); return; }
+    esp_netif_dhcps_stop(ap_netif);
+    dhcps_lease_t lease;
+    lease.enable        = true;
+    lease.start_ip.addr = esp_ip4addr_aton("192.168.4.4");
+    lease.end_ip.addr   = esp_ip4addr_aton("192.168.4.20");
+    esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+        ESP_NETIF_REQUESTED_IP_ADDRESS, &lease, sizeof(lease));
+    esp_netif_dhcps_start(ap_netif);
+    addLog("DHCP pool: 192.168.4.4 - 192.168.4.20");
+}
+
+// WFQ
+void runWFQWindow() {
+    uint32_t totalWeight = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i].active) totalWeight += clients[i].weight;
+    if (totalWeight == 0) { windowIndex++; return; }
+
+    uint32_t windowBytes = ((uint32_t)TOTAL_BW_KBPS * WINDOW_MS) / 8;
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!clients[i].active) continue;
+        uint32_t share = (windowBytes * clients[i].weight) / totalWeight;
+        clients[i].tokenBucket =
+            min(clients[i].tokenBucket + share, (uint32_t)BUCKET_MAX_BYTES);
+        clients[i].allocKbps =
+            ((uint32_t)clients[i].weight * TOTAL_BW_KBPS) / totalWeight;
+        clients[i].bytesTx = 0;
+    }
+    windowIndex++;
+}
+
+bool wfqConsume(const uint8_t* mac, uint32_t pktBytes) {
+    ClientRecord* c = findClient(mac);
+    if (!c) return true;
+    if (c->tokenBucket >= pktBytes) {
+        c->tokenBucket  -= pktBytes;
+        c->bytesTx      += pktBytes;
+        c->totalBytesTx += pktBytes;
+        return true;
+    }
+    c->droppedPkts++;
+    return false;
+}
+
+// Promiscuous sniffer
+void packet_handler(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (type != WIFI_PKT_DATA) return;
+    wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+    uint8_t* payload = pkt->payload;
+    uint16_t len     = pkt->rx_ctrl.sig_len;
+    if (len < 24) return;
+
+    uint8_t fc0    = payload[0];
+    uint8_t fc1    = payload[1];
+    uint8_t type_b = (fc0 >> 2) & 0x03;
+    uint8_t sub_b  = (fc0 >> 4) & 0x0F;
+    uint8_t tods   = fc1 & 0x01;
+    uint8_t fromds = (fc1 >> 1) & 0x01;
+    if (type_b != 2 || tods != 1 || fromds != 0) return;
+
+    uint8_t* src_mac = payload + 10;
+
+    // If blocked, keep deauthing every packet until they give up
+    if (isMacBlocked(src_mac)) {
+        deauthByMac(src_mac);
+        return;
+    }
+
+    wfqConsume(src_mac, len);
+
+    // Tethering detection
+    bool    qos       = (sub_b == 8);
+    int     dot11_hdr = qos ? 26 : 24;
+    if (len < (uint16_t)(dot11_hdr + 16)) return;
+    uint8_t* llc = payload + dot11_hdr;
+    if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03) return;
+    uint16_t ethertype = (llc[6] << 8) | llc[7];
+    if (ethertype != 0x0800) return;
+    uint8_t* ip  = llc + 8;
+    if ((ip[0] & 0xF0) != 0x40) return;
+    uint8_t ttl      = ip[8];
+    bool    tethered = (ttl == 63 || ttl == 127 || ttl == 254);
+    if (!tethered) return;
+
+    ClientRecord* rec = findClient(src_mac);
+    if (rec && !rec->tethering) {
+        rec->tethering = true;
+        addLog("TETHER DETECTED [" +
+               String(rec->isAdmin ? "ADMIN" : "GUEST") +
+               "] MAC: " + macToStr(src_mac) +
+               " TTL:" + String(ttl) + " - KICKING!");
+        deauthByMac(src_mac);
+    }
+}
+
+// Wi-Fi events
+void ipUpdateTask(void* param) {
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!clients[i].active) continue;
+        clients[i].ip = getIPFromARP(clients[i].mac);
+    }
+    vTaskDelete(NULL);
+}
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+    switch (event) {
+        case ARDUINO_EVENT_WIFI_AP_STACONNECTED: {
+            uint8_t* mac = info.wifi_ap_staconnected.mac;
+            uint8_t  aid = info.wifi_ap_staconnected.aid;
+
+            // If blocked, immediately deauth and do not register
+            if (isMacBlocked(mac)) {
+                addLog("BLOCKED RECONNECT ATTEMPT - MAC: " + macToStr(mac));
+                esp_wifi_deauth_sta(aid);
+                return;
+            }
+
+            ClientRecord* rec = addClient(mac, aid);
+            String role = (rec && rec->isAdmin) ? "ADMIN" : "GUEST";
+            addLog("CONNECTED [" + role + "] MAC: " + macToStr(mac) +
+                   " | weight: " + String(rec ? rec->weight : 0));
+            xTaskCreate(ipUpdateTask, "ipUpdate", 2048, NULL, 1, NULL);
+            break;
+        }
+        case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED: {
+            uint8_t* mac = info.wifi_ap_stadisconnected.mac;
+            ClientRecord* rec = findClient(mac);
+            if (rec && !rec->blocked)
+                addLog("DISCONNECTED [" +
+                       String(rec->isAdmin ? "ADMIN" : "GUEST") +
+                       "] MAC: " + macToStr(mac));
+            removeClient(mac);
+            break;
+        }
+        default: break;
+    }
+}
+
+// Display
+String fmtBytes(uint32_t b) {
+    if (b < 1024)    return String(b) + " B";
+    if (b < 1048576) return String(b / 1024.0, 1) + " KB";
+    return String(b / 1048576.0, 2) + " MB";
+}
+
+String fmtMbps(uint32_t kbps) {
+    return String(kbps / 1000.0, 2) + " Mbps";
+}
+
+String bwBar(uint32_t kbps, uint8_t pct, const char* color) {
+    String s = fmtMbps(kbps);
+    s += "<div style='width:110px;height:7px;background:#1a1a1a;"
+         "border-radius:3px;overflow:hidden;margin-top:3px'>";
+    s += "<div style='width:" + String(pct) + "%;height:100%;"
+         "background:" + color + ";border-radius:3px'></div></div>";
+    return s;
+}
+
+// Shared page <head> + <style>
+String pageHead(const String& title, const String& mode) {
+    String h = "<!DOCTYPE html><html><head>";
+    h += "<meta charset='UTF-8'>";
+    h += "<meta http-equiv='refresh' content='3'>";
+    h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+    h += "<title>" + title + "</title><style>";
+    h += "*{box-sizing:border-box;margin:0;padding:0}";
+    h += "body{font-family:monospace;background:#0d0d0d;color:#ccc;"
+         "padding:20px;min-height:100vh;display:flex;flex-direction:column}";
+    h += ".content{flex:1}";
+    h += "h1{color:#4fc3f7;font-size:18px;margin-bottom:3px}";
+    h += ".sub{color:#555;font-size:11px;margin-bottom:16px}";
+    h += "h3{color:#90caf9;border-bottom:1px solid #222;padding-bottom:5px;"
+         "margin:18px 0 10px;font-size:13px}";
+    h += ".pill{display:inline-block;padding:2px 8px;border-radius:99px;"
+         "font-size:10px;font-weight:bold}";
+    h += ".pa{background:#1b4332;color:#69f0ae}";
+    h += ".pg{background:#3e2000;color:#ffb74d}";
+    h += ".pt{background:#3e0000;color:#ff5252}";
+    h += ".pb{background:#3e0000;color:#ff5252}";
+    h += "footer{text-align:center;color:#ffffff;font-size:11px;"
+         "padding:24px 0 8px;letter-spacing:.04em}";
+    h += "footer span{color:#ffffff}";
+
+    if (mode == "admin") {
+        h += ".metrics{display:grid;grid-template-columns:repeat(3,1fr);"
+             "gap:8px;margin-bottom:4px}";
+        h += ".mc{background:#111;border:1px solid #1e1e1e;"
+             "border-radius:8px;padding:10px 14px}";
+        h += ".ml{font-size:10px;color:#555;margin-bottom:3px}";
+        h += ".mv{font-size:20px;font-weight:bold;color:#e0e0e0}";
+        h += ".mu{font-size:11px;color:#444}";
+        h += "table{width:100%;border-collapse:collapse;font-size:12px}";
+        h += "th{background:#1a1a2e;color:#90caf9;padding:8px 10px;"
+             "text-align:left;font-size:10px;text-transform:uppercase;"
+             "letter-spacing:.04em}";
+        h += "td{padding:8px 10px;border-bottom:1px solid #1a1a1a;"
+             "vertical-align:middle}";
+        h += "tr:hover td{background:#111}";
+        h += "select{background:#1a1a1a;color:#ccc;border:1px solid #333;"
+             "padding:3px 6px;font-size:11px;border-radius:4px}";
+        h += "input[type=submit]{background:transparent;"
+             "border:1px solid #4fc3f7;color:#4fc3f7;"
+             "padding:3px 8px;font-size:11px;border-radius:4px;cursor:pointer}";
+        h += "input[type=submit]:hover{background:#4fc3f722}";
+        h += ".kick-btn{background:transparent;border:1px solid #ef5350;"
+             "color:#ef5350;padding:3px 8px;font-size:11px;"
+             "border-radius:4px;cursor:pointer}";
+        h += ".kick-btn:hover{background:#ef535022}";
+        h += ".unblock-btn{background:transparent;border:1px solid #69f0ae;"
+             "color:#69f0ae;padding:3px 8px;font-size:11px;"
+             "border-radius:4px;cursor:pointer}";
+        h += ".unblock-btn:hover{background:#69f0ae22}";
+        h += ".logs{background:#000;color:#00e676;padding:12px;height:180px;"
+             "overflow-y:scroll;border:1px solid #1a1a1a;font-size:11px;"
+             "line-height:1.7;border-radius:5px}";
+    } else {
+        h += ".card{background:#111;border:1px solid #1e1e1e;"
+             "border-radius:10px;padding:16px 20px;margin-bottom:12px}";
+        h += ".lbl{font-size:11px;color:#555;margin-bottom:4px}";
+        h += ".val{font-size:26px;font-weight:bold;color:#e0e0e0}";
+        h += ".unit{font-size:13px;color:#444}";
+        h += ".row{display:flex;justify-content:space-between;"
+             "padding:7px 0;border-bottom:1px solid #1a1a1a;font-size:12px}";
+        h += ".row:last-child{border-bottom:none}";
+        h += ".key{color:#555}";
+    }
+    h += "</style></head><body><div class='content'>";
+    return h;
+}
+
+// Shared footer
+String pageFooter() {
+    String f = "</div>";   // close .content
+    f += "<footer>Niccolo Coronel &nbsp;<span>|</span>&nbsp; Jamie Evora</footer>";
+    f += "</body></html>";
+    return f;
+}
+
+// Blocked clients section for admin dashboard
+String blockedSection() {
+    if (blockedCount == 0) return "";
+
+    String s = "<h3>Blocked Clients</h3>";
+    s += "<table><thead><tr>"
+         "<th>MAC</th><th>Action</th>"
+         "</tr></thead><tbody>";
+
+    for (int i = 0; i < blockedCount; i++) {
+        s += "<tr>";
+        s += "<td style='font-size:11px'>" + blockedMacs[i] + "</td>";
+        s += "<td>";
+        s += "<form method='POST' action='/unblock' style='display:inline'>";
+        s += "<input type='hidden' name='mac' value='" + blockedMacs[i] + "'>";
+        s += "<input type='submit' value='Unblock' class='unblock-btn'>";
+        s += "</form></td></tr>";
+    }
+    s += "</tbody></table>";
+    return s;
+}
+
+// Guest status page
+void serveGuestStatus(ClientRecord* c, const String& mac) {
+    uint8_t pct = (TOTAL_BW_KBPS > 0 && c->allocKbps > 0)
+        ? (uint8_t)min((uint32_t)100, c->allocKbps * 100 / TOTAL_BW_KBPS)
+        : 0;
+
+    String html = pageHead("My Bandwidth", "guest");
+    html += "<h1>My Bandwidth</h1>";
+    html += "<p class='sub'>Auto-refreshes every 3s &nbsp;|&nbsp; "
+            "<span class='pill pg'>GUEST</span></p>";
+
+    html += "<div class='card'>";
+    html += "<div class='lbl'>Your allocated bandwidth</div>";
+    html += "<div class='val'>" + String(c->allocKbps / 1000.0, 2) +
+            "<span class='unit'> Mbps</span></div>";
+    html += "<div style='margin-top:10px;height:10px;background:#1a1a1a;"
+            "border-radius:5px;overflow:hidden'>";
+    html += "<div style='width:" + String(pct) +
+            "%;height:100%;background:#ffb74d;border-radius:5px'></div></div>";
+    html += "<div style='font-size:10px;color:#555;margin-top:4px'>"
+            + String(pct) + "% of total " +
+            String(TOTAL_BW_MBPS) + " Mbps</div>";
+    html += "</div>";
+
+    html += "<div class='card'>";
+    html += "<div class='row'><span class='key'>MAC address</span>"
+            "<span>" + mac + "</span></div>";
+    html += "<div class='row'><span class='key'>IP address</span>"
+            "<span>" + c->ip + "</span></div>";
+    html += "<div class='row'><span class='key'>WFQ weight</span>"
+            "<span>" + String(c->weight) + " / 10</span></div>";
+    html += "<div class='row'><span class='key'>Allocated</span>"
+            "<span>" + fmtMbps(c->allocKbps) + "</span></div>";
+    html += "<div class='row'><span class='key'>Token bucket</span>"
+            "<span>" + String(c->tokenBucket) + " B</span></div>";
+    html += "<div class='row'><span class='key'>Total sent</span>"
+            "<span>" + fmtBytes(c->totalBytesTx) + "</span></div>";
+    html += "<div class='row'><span class='key'>Dropped packets</span>"
+            "<span style='color:" +
+            String(c->droppedPkts > 0 ? "#ef5350" : "#555") + "'>" +
+            String(c->droppedPkts) + "</span></div>";
+    html += "</div>";
+
+    html += "<p style='font-size:10px;color:#333;margin-top:8px'>"
+            "Contact the network admin to request more bandwidth.</p>";
+
+    html += pageFooter();
+    server.send(200, "text/html", html);
+}
+
+// Admin dashboard
+void serveAdminDashboard() {
+    String html = pageHead("Gatekeeper", "admin");
+    html += "<h1>Gatekeeper</h1>";
+    html += "<p class='sub'>Auto-refreshes every 3s &nbsp;|&nbsp; "
+            "Window: " + String(windowIndex) +
+            " &nbsp;|&nbsp; <span class='pill pa'>ADMIN</span></p>";
+
+    // Metric cards
+    uint32_t totalAlloc = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i].active) totalAlloc += clients[i].allocKbps;
+
+    html += "<div class='metrics'>";
+    html += "<div class='mc'><div class='ml'>Total capacity</div>"
+            "<div class='mv'>" + String(TOTAL_BW_MBPS) +
+            "<span class='mu'> Mbps</span></div></div>";
+    html += "<div class='mc'><div class='ml'>Active clients</div>"
+            "<div class='mv'>" + String(clientCount) + "</div></div>";
+    html += "<div class='mc'><div class='ml'>Total allocated</div>"
+            "<div class='mv'>" + String(totalAlloc / 1000.0, 1) +
+            "<span class='mu'> Mbps</span></div></div>";
+    html += "</div>";
+
+    // Allocation table
+    html += "<h3>Bandwidth Allocation</h3>";
+
+    if (clientCount == 0) {
+        html += "<p style='color:#333;padding:16px 0'>No clients connected.</p>";
+    } else {
+        const char* colors[] = {
+            "#4fc3f7","#69f0ae","#ffb74d","#cf6679",
+            "#ce93d8","#80cbc4","#fff176","#a5d6a7"
+        };
+
+        html += "<table><thead><tr>"
+                "<th>MAC</th><th>IP</th><th>Role</th>"
+                "<th>Allocation</th><th>Total TX</th>"
+                "<th>Dropped</th><th>Tethering</th>"
+                "<th>Set weight</th><th>Action</th>"
+                "</tr></thead><tbody>";
+
+        int ci = 0;
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (!clients[i].active) continue;
+            ClientRecord& c   = clients[i];
+            const char*   col = colors[ci++ % 8];
+            uint8_t pct = (uint8_t)min(
+                (uint32_t)100,
+                c.allocKbps * 100 / max((uint32_t)1, (uint32_t)TOTAL_BW_KBPS));
+
+            html += "<tr>";
+            html += "<td style='font-size:11px'>" + macToStr(c.mac) + "</td>";
+            html += "<td style='font-size:11px'>" + c.ip + "</td>";
+            html += "<td>" + String(c.isAdmin
+                ? "<span class='pill pa'>ADMIN</span>"
+                : "<span class='pill pg'>GUEST</span>") + "</td>";
+            html += "<td>" + bwBar(c.allocKbps, pct, col) + "</td>";
+            html += "<td>" + fmtBytes(c.totalBytesTx) + "</td>";
+            html += "<td style='color:" +
+                    String(c.droppedPkts > 0 ? "#ef5350" : "#555") +
+                    "'>" + String(c.droppedPkts) + "</td>";
+            html += "<td>" + String(c.tethering
+                ? "<span class='pill pt'>YES</span>"
+                : "<span style='color:#333'>-</span>") + "</td>";
+
+            // Weight form
+            html += "<td>";
+            html += "<form method='POST' action='/setweight'"
+                    " style='display:inline'>";
+            html += "<input type='hidden' name='mac' value='"
+                    + macToStr(c.mac) + "'>";
+            html += "<select name='weight'>";
+            for (int w = 1; w <= 10; w++) {
+                html += "<option value='" + String(w) + "'";
+                if (w == c.weight) html += " selected";
+                html += ">" + String(w) + "</option>";
+            }
+            html += "</select> <input type='submit' value='Set'>";
+            html += "</form></td>";
+
+            // Kick/block button — only show for guests, not admins
+            html += "<td>";
+            if (!c.isAdmin) {
+                html += "<form method='POST' action='/kick'"
+                        " style='display:inline'>";
+                html += "<input type='hidden' name='mac' value='"
+                        + macToStr(c.mac) + "'>";
+                html += "<input type='submit' value='Kick' class='kick-btn'>";
+                html += "</form>";
+            } else {
+                html += "<span style='color:#333'>-</span>";
+            }
+            html += "</td>";
+
+            html += "</tr>";
+        }
+        html += "</tbody></table>";
+    }
+
+    // Blocked clients section
+    html += blockedSection();
+
+    // Security logs
+    html += "<h3>Security Logs</h3><div class='logs'>";
+    for (int i = 0; i < logCount; i++)
+        html += securityLogs[i] + "<br>";
+    if (logCount == 0) html += "No logs yet.";
+    html += "</div>";
+
+    html += pageFooter();
+    server.send(200, "text/html", html);
+}
+
+// Waiting page
+void serveWaitPage(const String& ip) {
+    String html = pageHead("Connecting...", "guest");
+    html += "<h1>Connecting...</h1>";
+    html += "<p class='sub'>Auto-refreshes every 3s</p>";
+    html += "<div class='card'>";
+    html += "<p style='color:#888;font-size:13px;line-height:1.8'>"
+            "Your IP: " + ip + "<br>"
+            "Registering your device, please wait a moment...<br>"
+            "This page will refresh automatically.</p>";
+    html += "</div>";
+    html += pageFooter();
+    server.send(200, "text/html", html);
+}
+
+// GET /  — admin only, guests get 403
+void handleRoot() {
+    IPAddress clientIP  = server.client().remoteIP();
+    String    clientMAC = getMacFromARP(clientIP);
+
+    if (clientMAC == "UNKNOWN" || !strMacIsAdmin(clientMAC)) {
+        if (shouldLogAccess("BLOCK_" + clientIP.toString()))
+            addLog("403 [" + clientMAC + "] IP: " + clientIP.toString());
+        server.send(403, "text/html",
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<style>"
+            "*{box-sizing:border-box;margin:0;padding:0}"
+            "body{font-family:monospace;background:#0d0d0d;color:#ccc;"
+            "padding:40px;min-height:100vh;display:flex;flex-direction:column}"
+            ".content{flex:1}"
+            "h1{color:#ef5350;font-size:22px;margin-bottom:12px}"
+            "p{color:#555;font-size:13px;margin-bottom:8px}"
+            "a{color:#4fc3f7;text-decoration:none}"
+            "footer{text-align:center;color:#ffffff;font-size:11px;"
+            "padding:24px 0 8px;letter-spacing:.04em}"
+            "footer span{color:#ffffff}"
+            "</style></head><body>"
+            "<div class='content'>"
+            "<h1>403 Forbidden</h1>"
+            "<p>Admin hardware only.</p>"
+            "<p><a href='/status'>View your bandwidth &rarr;</a></p>"
+            "</div>"
+            "<footer>Niccolo Coronel &nbsp;<span>|</span>&nbsp; Jamie Evora</footer>"
+            "</body></html>");
+        return;
+    }
+
+    if (shouldLogAccess(clientIP.toString()))
+        addLog("ADMIN DASHBOARD - IP: " + clientIP.toString() +
+               " MAC: " + clientMAC);
+
+    serveAdminDashboard();
+}
+
+// GET /status  — open to everyone
+void handleStatus() {
+    IPAddress clientIP  = server.client().remoteIP();
+    String    clientMAC = getMacFromARP(clientIP);
+
+    if (clientMAC == "UNKNOWN") {
+        serveWaitPage(clientIP.toString());
+        return;
+    }
+
+    bool isAdmin = strMacIsAdmin(clientMAC);
+
+    if (shouldLogAccess(clientIP.toString()))
+        addLog("STATUS [" + String(isAdmin ? "ADMIN" : "GUEST") +
+               "] IP: " + clientIP.toString() +
+               " MAC: " + clientMAC);
+
+    if (isAdmin) {
+        serveAdminDashboard();
+        return;
+    }
+
+    ClientRecord* self = findClientByIP(clientIP.toString());
+    if (!self) {
+        serveWaitPage(clientIP.toString());
+        return;
+    }
+
+    serveGuestStatus(self, clientMAC);
+}
+
+// POST /kick  — admin only, kicks + blocks a guest by MAC
+void handleKick() {
+    IPAddress clientIP  = server.client().remoteIP();
+    String    clientMAC = getMacFromARP(clientIP);
+
+    if (!strMacIsAdmin(clientMAC)) {
+        server.send(403, "text/plain", "Forbidden");
+        return;
+    }
+    if (server.hasArg("mac")) {
+        String targetMac = server.arg("mac");
+
+        // Add to blocked list
+        blockMac(targetMac);
+
+        // Mark in client record
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].active &&
+                macToStr(clients[i].mac).equalsIgnoreCase(targetMac)) {
+                clients[i].blocked = true;
+                break;
+            }
+        }
+
+        // Deauth (kick off Wi-Fi)
+        deauthByMacStr(targetMac);
+
+        addLog("KICKED + BLOCKED - MAC: " + targetMac +
+               " by admin " + clientMAC);
+    }
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
+}
+
+// POST /unblock  — admin only, removes a MAC from blocked list
+void handleUnblock() {
+    IPAddress clientIP  = server.client().remoteIP();
+    String    clientMAC = getMacFromARP(clientIP);
+
+    if (!strMacIsAdmin(clientMAC)) {
+        server.send(403, "text/plain", "Forbidden");
+        return;
+    }
+    if (server.hasArg("mac")) {
+        String targetMac = server.arg("mac");
+        unblockMac(targetMac);
+        addLog("UNBLOCKED - MAC: " + targetMac +
+               " by admin " + clientMAC);
+    }
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
+}
+
+// POST /setweight  — admin only
+void handleSetWeight() {
+    IPAddress clientIP  = server.client().remoteIP();
+    String    clientMAC = getMacFromARP(clientIP);
+
+    if (!strMacIsAdmin(clientMAC)) {
+        server.send(403, "text/plain", "Forbidden");
+        return;
+    }
+    if (server.hasArg("mac") && server.hasArg("weight")) {
+        String targetMac = server.arg("mac");
+        int    newWeight = server.arg("weight").toInt();
+        if (newWeight >= 1 && newWeight <= 10) {
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (clients[i].active &&
+                    macToStr(clients[i].mac).equalsIgnoreCase(targetMac)) {
+                    clients[i].weight = (uint8_t)newWeight;
+                    addLog("WEIGHT CHANGED - " + targetMac +
+                           " -> " + String(newWeight) +
+                           " by " + clientMAC);
+                    break;
+                }
+            }
+        }
+    }
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
+}
+
+
+void handleCaptive() {
+    server.sendHeader("Location", "http://192.168.4.1/status");
+    server.send(302, "text/plain", "");
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+    memset(clients, 0, sizeof(clients));
+
+    WiFi.onEvent(onWiFiEvent);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(
+        IPAddress(192, 168, 4, 1),
+        IPAddress(192, 168, 4, 1),
+        IPAddress(255, 255, 255, 0)
+    );
+    WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, 0, MAX_CLIENTS);
+
+    configureIPRanges();
+
+    dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+
+    server.on("/",           HTTP_GET,  handleRoot);
+    server.on("/status",     HTTP_GET,  handleStatus);
+    server.on("/setweight",  HTTP_POST, handleSetWeight);
+    server.on("/kick",       HTTP_POST, handleKick);
+    server.on("/unblock",    HTTP_POST, handleUnblock);
+    server.onNotFound(handleCaptive);
+    server.begin();
+
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(&packet_handler);
+
+    addLog("Online | SSID: " + String(AP_SSID));
+    addLog("WFQ: " + String(TOTAL_BW_MBPS) + " Mbps total"
+           " | admin_w=" + String(WEIGHT_ADMIN) +
+           " | guest_w=" + String(WEIGHT_GUEST));
+    addLog("Admins: " + String(adminCount) + " registered");
+
+    lastWindowMs = millis();
+}
+
+void loop() {
+    uint32_t now = millis();
+
+    if (now - lastWindowMs >= WINDOW_MS) {
+        lastWindowMs = now;
+        runWFQWindow();
+    }
+
+    dnsServer.processNextRequest();
+    server.handleClient();
+}
